@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto"
-import { chmod, unlink } from "node:fs/promises"
+import { chmod, mkdtemp, rm, unlink, writeFile } from "node:fs/promises"
 import { createServer, type Server, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
@@ -15,6 +15,7 @@ import type {
   ProcessRunner,
   RunProcessRequest
 } from "../process/ProcessRunner"
+import { WINDOWS_ASKPASS_EXECUTABLE_BASE64 } from "./windowsAskpassExecutable"
 
 const ENDPOINT_ENV = "SSH_SESSION_ASKPASS_ENDPOINT"
 const TOKEN_ENV = "SSH_SESSION_ASKPASS_TOKEN"
@@ -66,26 +67,46 @@ interface AskpassResponse {
   readonly error?: string
 }
 
+interface PreparedHelper {
+  readonly path: string
+  cleanup(): Promise<void>
+}
+
 export class OpenSshAskpassBroker {
   open(options: AskpassBrokerOptions): Promise<AskpassSession> {
     validateOptions(options)
 
     const endpoint = createEndpoint()
     const token = randomBytes(32).toString("hex")
-    const helperPath = options.helperPath ?? resolve(__dirname, "askpassHelper.js")
     const state = new BrokerState(options, token)
     const sockets = new Set<Socket>()
+    let preparedHelper: PreparedHelper | undefined
     const server = createServer((socket) => {
       sockets.add(socket)
       socket.once("close", () => sockets.delete(socket))
       handleSocket(socket, state, options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
     })
 
-    return prepareHelper(helperPath)
-      .then(() => listen(server, endpoint))
-      .then(() => createSession(server, sockets, state, endpoint, token, helperPath, options))
+    return prepareHelper(options.helperPath)
+      .then((helper) => {
+        preparedHelper = helper
+        return listen(server, endpoint)
+      })
+      .then(() => createSession(
+        server,
+        sockets,
+        state,
+        endpoint,
+        token,
+        preparedHelper?.path ?? "",
+        preparedHelper?.cleanup ?? (() => Promise.resolve()),
+        options
+      ))
       .catch((error: unknown) => {
-        return removeEndpoint(endpoint)
+        return Promise.allSettled([
+          removeEndpoint(endpoint),
+          preparedHelper?.cleanup() ?? Promise.resolve()
+        ])
           .then(() => Promise.reject(toBrokerError(error, "start-askpass-broker")))
       })
   }
@@ -368,6 +389,7 @@ function createSession(
   endpoint: string,
   token: string,
   helperPath: string,
+  cleanupHelper: () => Promise<void>,
   options: AskpassBrokerOptions
 ): AskpassSession {
   let closePromise: Promise<void> | undefined
@@ -395,6 +417,7 @@ function createSession(
 
     closePromise = closeServer(server)
       .then(() => removeEndpoint(endpoint))
+      .finally(cleanupHelper)
 
     return closePromise
   }
@@ -461,12 +484,47 @@ function removeEndpoint(endpoint: string): Promise<void> {
   })
 }
 
-function prepareHelper(helperPath: string): Promise<void> {
-  if (process.platform === "win32") {
-    return Promise.resolve()
+function prepareHelper(configuredPath: string | undefined): Promise<PreparedHelper> {
+  if (configuredPath !== undefined) {
+    return prepareExistingHelper(configuredPath)
   }
 
-  return chmod(helperPath, 0o700)
+  if (process.platform !== "win32") {
+    return prepareExistingHelper(resolve(__dirname, "askpassHelper.js"))
+  }
+
+  return createWindowsHelper()
+}
+
+function prepareExistingHelper(helperPath: string): Promise<PreparedHelper> {
+  const prepare = process.platform === "win32"
+    ? Promise.resolve()
+    : chmod(helperPath, 0o700)
+
+  return prepare.then(() => ({
+    path: helperPath,
+    cleanup: () => Promise.resolve()
+  }))
+}
+
+function createWindowsHelper(): Promise<PreparedHelper> {
+  return mkdtemp(join(tmpdir(), "ssh-session-askpass-"))
+    .then((directory) => {
+      const helperPath = join(directory, "askpass.exe")
+      const executable = Buffer.from(WINDOWS_ASKPASS_EXECUTABLE_BASE64, "base64")
+
+      if (executable[0] !== 0x4d || executable[1] !== 0x5a) {
+        return rm(directory, { recursive: true, force: true })
+          .then(() => Promise.reject(new Error("invalid embedded Windows ASKPASS executable")))
+      }
+
+      return writeFile(helperPath, executable, { flag: "wx", mode: 0o700 })
+        .then(() => ({
+          path: helperPath,
+          cleanup: () => rm(directory, { recursive: true, force: true })
+        }))
+        .finally(() => executable.fill(0))
+    })
 }
 
 function tokensEqual(actual: string, expected: string): boolean {

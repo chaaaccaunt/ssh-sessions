@@ -88,14 +88,14 @@ test("ASKPASS sends a password over one-time IPC without putting it in argv or e
     hostKeyPolicy: "strict"
   })
   const runner = new NodeProcessRunner()
+  const helperPath = session.environment.SSH_ASKPASS!
 
   try {
     const serializedEnvironment = JSON.stringify(session.environment)
     assert.equal(serializedEnvironment.includes(secretText), false)
 
     const result = await runner.run({
-      executable: process.execPath,
-      args: [session.environment.SSH_ASKPASS!, "operator@example.test's password:"],
+      ...createAskpassInvocation(helperPath, "operator@example.test's password:"),
       environment: session.environment,
       stdio: "capture",
       timeoutMs: 5_000
@@ -110,6 +110,8 @@ test("ASKPASS sends a password over one-time IPC without putting it in argv or e
 
     if (process.platform !== "win32") {
       await assert.rejects(access(endpoint))
+    } else {
+      await assert.rejects(access(helperPath))
     }
   }
 })
@@ -132,8 +134,7 @@ test("ASKPASS never supplies a password to fingerprint or MFA prompts", async ()
 
   try {
     const result = await runner.run({
-      executable: process.execPath,
-      args: [session.environment.SSH_ASKPASS!, "Verification code:"],
+      ...createAskpassInvocation(session.environment.SSH_ASKPASS!, "Verification code:"),
       environment: session.environment,
       stdio: "capture",
       timeoutMs: 5_000
@@ -147,6 +148,17 @@ test("ASKPASS never supplies a password to fingerprint or MFA prompts", async ()
     await session.close()
   }
 })
+
+function createAskpassInvocation(
+  helperPath: string,
+  prompt: string
+): Pick<RunProcessRequest, "executable" | "args"> {
+  if (process.platform === "win32") {
+    return { executable: helperPath, args: [prompt] }
+  }
+
+  return { executable: process.execPath, args: [helperPath, prompt] }
+}
 
 class RecordingProcessRunner implements ProcessRunner {
   readonly requests: RunProcessRequest[] = []
