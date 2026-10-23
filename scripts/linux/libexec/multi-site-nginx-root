@@ -1,0 +1,154 @@
+#!/bin/bash
+set -euo pipefail
+
+NGINX_EXECUTABLE="/usr/sbin/nginx"
+SITES_AVAILABLE_DIRECTORY="/etc/nginx/sites-available"
+SITES_ENABLED_DIRECTORY="/etc/nginx/sites-enabled"
+MAXIMUM_CONFIG_SIZE=262144
+LOCK_FILE="/run/lock/multi-site-nginx.lock"
+
+validate_site_uid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+    echo "Некорректный uid сайта" >&2
+    exit 64
+  }
+}
+
+validate_nginx_configuration() {
+  local validation_output
+  if ! validation_output="$("$NGINX_EXECUTABLE" -t 2>&1)"; then
+    echo "$validation_output" >&2
+    return 1
+  fi
+  if [[ "$validation_output" == *"conflicting server name"* ]]; then
+    echo "$validation_output" >&2
+    echo "Обнаружен конфликт server_name с существующей nginx-конфигурацией" >&2
+    return 1
+  fi
+  echo "$validation_output" >&2
+}
+
+apply_configuration() {
+  [[ $# -eq 1 ]] || { echo "Формат команды: apply <siteUid>" >&2; exit 64; }
+  local site_uid="$1"
+  validate_site_uid "$site_uid"
+
+  local file_name="$site_uid.conf"
+  local target_path="$SITES_AVAILABLE_DIRECTORY/$file_name"
+  local enabled_path="$SITES_ENABLED_DIRECTORY/$file_name"
+  local temporary_path
+  local temporary_link="$SITES_ENABLED_DIRECTORY/.$file_name.link-$$"
+  local target_backup="$SITES_AVAILABLE_DIRECTORY/.$file_name.backup-$$"
+  local enabled_backup="$SITES_ENABLED_DIRECTORY/.$file_name.backup-$$"
+  local rollback_required=0
+
+  temporary_path="$(mktemp "$SITES_AVAILABLE_DIRECTORY/.$file_name.input-XXXXXX")"
+
+  cleanup() {
+    local status=$?
+    set +e
+    rm -f -- "$temporary_path" "$temporary_link"
+
+    if [[ "$rollback_required" -eq 1 ]]; then
+      rm -f -- "$enabled_path" "$target_path"
+      [[ -e "$target_backup" ]] && mv -- "$target_backup" "$target_path"
+      [[ -e "$enabled_backup" || -L "$enabled_backup" ]] && mv -- "$enabled_backup" "$enabled_path"
+      "$NGINX_EXECUTABLE" -t >/dev/null 2>&1 && "$NGINX_EXECUTABLE" -s reload >/dev/null 2>&1
+    else
+      rm -f -- "$target_backup" "$enabled_backup"
+    fi
+
+    exit "$status"
+  }
+  trap cleanup EXIT
+
+  /usr/bin/head -c "$((MAXIMUM_CONFIG_SIZE + 1))" > "$temporary_path"
+  [[ -s "$temporary_path" ]] || { echo "Получена пустая nginx-конфигурация" >&2; exit 64; }
+  [[ "$(stat -c %s "$temporary_path")" -le "$MAXIMUM_CONFIG_SIZE" ]] || { echo "nginx-конфигурация превышает допустимый размер" >&2; exit 64; }
+  chown root:root "$temporary_path"
+  chmod 0644 "$temporary_path"
+
+  if [[ -e "$enabled_path" || -L "$enabled_path" ]]; then
+    [[ -L "$enabled_path" ]] || { echo "Управляемый enabled path не является символической ссылкой" >&2; exit 1; }
+    [[ "$(readlink -- "$enabled_path")" == "$target_path" ]] || { echo "Управляемая ссылка указывает на неожиданный путь" >&2; exit 1; }
+  fi
+
+  rollback_required=1
+  [[ ! -e "$target_path" ]] || mv -- "$target_path" "$target_backup"
+  [[ ! -e "$enabled_path" && ! -L "$enabled_path" ]] || mv -- "$enabled_path" "$enabled_backup"
+  mv -- "$temporary_path" "$target_path"
+  ln -s -- "$target_path" "$temporary_link"
+  mv -Tf -- "$temporary_link" "$enabled_path"
+
+  validate_nginx_configuration
+  "$NGINX_EXECUTABLE" -s reload
+  rollback_required=0
+}
+
+remove_configuration() {
+  [[ $# -eq 1 ]] || { echo "Формат команды: remove <siteUid>" >&2; exit 64; }
+  local site_uid="$1"
+  validate_site_uid "$site_uid"
+
+  local file_name="$site_uid.conf"
+  local target_path="$SITES_AVAILABLE_DIRECTORY/$file_name"
+  local enabled_path="$SITES_ENABLED_DIRECTORY/$file_name"
+  local target_backup="$SITES_AVAILABLE_DIRECTORY/.$file_name.remove-backup-$$"
+  local enabled_backup="$SITES_ENABLED_DIRECTORY/.$file_name.remove-backup-$$"
+  local rollback_required=0
+
+  cleanup_remove() {
+    local status=$?
+    set +e
+
+    if [[ "$rollback_required" -eq 1 ]]; then
+      [[ -e "$target_backup" ]] && mv -- "$target_backup" "$target_path"
+      [[ -e "$enabled_backup" || -L "$enabled_backup" ]] && mv -- "$enabled_backup" "$enabled_path"
+      "$NGINX_EXECUTABLE" -t >/dev/null 2>&1 && "$NGINX_EXECUTABLE" -s reload >/dev/null 2>&1
+    else
+      rm -f -- "$target_backup" "$enabled_backup"
+    fi
+
+    exit "$status"
+  }
+  trap cleanup_remove EXIT
+
+  if [[ -e "$enabled_path" || -L "$enabled_path" ]]; then
+    [[ -L "$enabled_path" ]] || { echo "Управляемый enabled path не является символической ссылкой" >&2; exit 1; }
+    [[ "$(readlink -- "$enabled_path")" == "$target_path" ]] || { echo "Управляемая ссылка указывает на неожиданный путь" >&2; exit 1; }
+  fi
+
+  rollback_required=1
+  [[ ! -e "$target_path" ]] || mv -- "$target_path" "$target_backup"
+  [[ ! -e "$enabled_path" && ! -L "$enabled_path" ]] || mv -- "$enabled_path" "$enabled_backup"
+
+  validate_nginx_configuration
+  "$NGINX_EXECUTABLE" -s reload
+  rollback_required=0
+}
+
+acquire_lock() {
+  exec 9>"$LOCK_FILE"
+  /usr/bin/flock -x 9
+}
+
+case "${1:-}" in
+  apply)
+    shift
+    acquire_lock
+    apply_configuration "$@"
+    ;;
+  remove)
+    shift
+    acquire_lock
+    remove_configuration "$@"
+    ;;
+  -t)
+    [[ $# -eq 1 ]] || { echo "Разрешена только команда nginx -t" >&2; exit 64; }
+    exec "$NGINX_EXECUTABLE" -t
+    ;;
+  *)
+    echo "Разрешены только apply <siteUid>, remove <siteUid> и nginx -t" >&2
+    exit 64
+    ;;
+esac

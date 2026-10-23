@@ -1,0 +1,76 @@
+#!/bin/bash
+set -euo pipefail
+
+CERTIFICATE_DIRECTORY="/etc/letsencrypt/live"
+OPENSSL_EXECUTABLE="/usr/bin/openssl"
+
+is_hostname() {
+  local value="$1"
+  local labels=()
+  local label
+  [[ ${#value} -le 253 ]] || return 1
+  [[ "$value" == *.* ]] || return 1
+  IFS="." read -r -a labels <<< "$value"
+  ((${#labels[@]} >= 2)) || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+  [[ ! "${labels[${#labels[@]} - 1]}" =~ ^[0-9]+$ ]]
+}
+
+minimum_validity_seconds=0
+if [[ "${1:-}" == "--min-valid-seconds" ]]; then
+  [[ $# -ge 3 && "$2" =~ ^[0-9]+$ && "$2" -le 31536000 ]] || { echo "Некорректный минимальный срок действия" >&2; exit 64; }
+  minimum_validity_seconds="$2"
+  shift 2
+fi
+
+(($# > 0)) || { echo "Укажите хотя бы один hostname" >&2; exit 64; }
+[[ -x "$OPENSSL_EXECUTABLE" ]] || { echo "Не найден $OPENSSL_EXECUTABLE" >&2; exit 1; }
+[[ -d "$CERTIFICATE_DIRECTORY" ]] || exit 2
+
+hostnames=()
+for hostname in "$@"; do
+  is_hostname "$hostname" || { echo "Некорректный hostname: $hostname" >&2; exit 64; }
+  hostnames+=("${hostname,,}")
+done
+
+shopt -s nullglob
+for certificate_path in "$CERTIFICATE_DIRECTORY"/*; do
+  certificate_name="$(basename "$certificate_path")"
+  [[ "$certificate_name" =~ ^[A-Za-z0-9.-]+$ ]] || continue
+
+  fullchain_path="$certificate_path/fullchain.pem"
+  private_key_path="$certificate_path/privkey.pem"
+  [[ -r "$fullchain_path" && -r "$private_key_path" ]] || continue
+  "$OPENSSL_EXECUTABLE" x509 -checkend "$minimum_validity_seconds" -noout -in "$fullchain_path" >/dev/null 2>&1 || continue
+
+  not_before="$($OPENSSL_EXECUTABLE x509 -startdate -noout -in "$fullchain_path" 2>/dev/null)" || continue
+  not_before="${not_before#notBefore=}"
+  not_before_epoch="$(/usr/bin/date -d "$not_before" +%s 2>/dev/null)" || continue
+  ((not_before_epoch <= $(/usr/bin/date +%s))) || continue
+
+  certificate_key_hash="$("$OPENSSL_EXECUTABLE" x509 -pubkey -noout -in "$fullchain_path" 2>/dev/null | "$OPENSSL_EXECUTABLE" pkey -pubin -outform DER 2>/dev/null | "$OPENSSL_EXECUTABLE" dgst -sha256 -r | /usr/bin/cut -d' ' -f1)" || continue
+  private_key_hash="$("$OPENSSL_EXECUTABLE" pkey -passin pass: -in "$private_key_path" -pubout -outform DER 2>/dev/null | "$OPENSSL_EXECUTABLE" dgst -sha256 -r | /usr/bin/cut -d' ' -f1)" || continue
+  [[ -n "$certificate_key_hash" && "$certificate_key_hash" == "$private_key_hash" ]] || continue
+
+  is_suitable=true
+  for hostname in "${hostnames[@]}"; do
+    hostname_check="$("$OPENSSL_EXECUTABLE" x509 -checkhost "$hostname" -noout -in "$fullchain_path" 2>/dev/null)" || {
+      is_suitable=false
+      break
+    }
+    if [[ "$hostname_check" != "Hostname $hostname does match certificate" ]]; then
+      is_suitable=false
+      break
+    fi
+  done
+
+  if [[ "$is_suitable" == true ]]; then
+    printf '%s\n%s\n' "$fullchain_path" "$private_key_path"
+    exit 0
+  fi
+done
+
+exit 2

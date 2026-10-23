@@ -1,0 +1,28 @@
+{
+  "name": "ssh-session",
+  "version": "1.0.0",
+  "description": "Terminal-first wrapper around the system OpenSSH client",
+  "main": "build/src/index.js",
+  "bin": {
+    "ssh-session": "build/src/bin/index.js"
+  },
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "check": "npm run typecheck && npm test",
+    "doctor": "npm run build && node build/src/bin/index.js doctor",
+    "start": "npm run build && node build/src/bin/index.js",
+    "test": "npm run build && node --test build/src/**/*.test.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}

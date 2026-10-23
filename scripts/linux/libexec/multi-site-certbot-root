@@ -1,0 +1,98 @@
+#!/bin/bash
+set -euo pipefail
+
+CERTBOT_EXECUTABLE="/usr/bin/certbot"
+ALLOWED_WEBROOT="/var/lib/multi-site/acme"
+LOCK_FILE="/run/lock/multi-site-certbot.lock"
+
+is_hostname() {
+  local value="$1"
+  local labels=()
+  local label
+  [[ ${#value} -le 253 ]] || return 1
+  [[ "$value" == *.* ]] || return 1
+  IFS="." read -r -a labels <<< "$value"
+  ((${#labels[@]} >= 2)) || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
+  [[ ! "${labels[${#labels[@]} - 1]}" =~ ^[0-9]+$ ]]
+}
+
+is_email() {
+  [[ "$1" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]
+}
+
+[[ "${1:-}" == "certonly" ]] || { echo "Разрешена только команда certbot certonly" >&2; exit 64; }
+shift
+
+email=""
+webroot=""
+certificate_name=""
+domains=()
+seen_webroot=false
+seen_non_interactive=false
+seen_agree_tos=false
+
+while (($#)); do
+  case "$1" in
+    --webroot)
+      seen_webroot=true
+      shift
+      ;;
+    --non-interactive)
+      seen_non_interactive=true
+      shift
+      ;;
+    --agree-tos)
+      seen_agree_tos=true
+      shift
+      ;;
+    --email)
+      [[ $# -ge 2 ]] || { echo "Отсутствует email" >&2; exit 64; }
+      email="$2"
+      shift 2
+      ;;
+    --webroot-path)
+      [[ $# -ge 2 ]] || { echo "Отсутствует webroot path" >&2; exit 64; }
+      webroot="$2"
+      shift 2
+      ;;
+    --cert-name)
+      [[ $# -ge 2 ]] || { echo "Отсутствует cert-name" >&2; exit 64; }
+      certificate_name="$2"
+      shift 2
+      ;;
+    -d)
+      [[ $# -ge 2 ]] || { echo "Отсутствует hostname после -d" >&2; exit 64; }
+      domains+=("$2")
+      shift 2
+      ;;
+    *)
+      echo "Недопустимый аргумент certbot: $1" >&2
+      exit 64
+      ;;
+  esac
+done
+
+[[ "$seen_webroot" == true && "$seen_non_interactive" == true && "$seen_agree_tos" == true ]] || { echo "Отсутствуют обязательные безопасные флаги certbot" >&2; exit 64; }
+[[ "$webroot" == "$ALLOWED_WEBROOT" ]] || { echo "Недопустимый webroot path" >&2; exit 64; }
+is_email "$email" || { echo "Некорректный email" >&2; exit 64; }
+is_hostname "$certificate_name" || { echo "Некорректный cert-name" >&2; exit 64; }
+((${#domains[@]} > 0)) || { echo "Не указан ни один домен" >&2; exit 64; }
+
+for domain in "${domains[@]}"; do
+  is_hostname "$domain" || { echo "Некорректный hostname: $domain" >&2; exit 64; }
+done
+
+[[ "${domains[0]}" == "$certificate_name" ]] || { echo "Первый домен должен совпадать с cert-name" >&2; exit 64; }
+
+arguments=(certonly --webroot --non-interactive --agree-tos --email "$email" --webroot-path "$webroot" --cert-name "$certificate_name")
+for domain in "${domains[@]}"; do
+  arguments+=(-d "$domain")
+done
+
+exec 9>"$LOCK_FILE"
+/usr/bin/flock -x 9
+exec "$CERTBOT_EXECUTABLE" "${arguments[@]}"

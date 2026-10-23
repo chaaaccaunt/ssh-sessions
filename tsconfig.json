@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@/libs": [
+        "./libs"
+      ],
+      "@/libs/*": [
+        "./libs/*"
+      ]
+    },
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "./src/**/*.ts",
+    "./libs/**/*.ts",
+    "./@types/**/*.d.ts"
+  ],
+  "exclude": [
+    "./build",
+    "./node_modules"
+  ]
+}
